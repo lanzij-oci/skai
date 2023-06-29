@@ -511,7 +511,7 @@ def _split_examples(
     c = example.features.feature['encoded_coordinates'].bytes_list.value[0]
     coordinates_to_examples[c].append(example)
 
-  shuffled = random.sample(coordinates_to_examples.keys(),
+  shuffled = random.sample(sorted(coordinates_to_examples.keys()),
                            len(coordinates_to_examples))
   num_test = int(len(shuffled) * test_fraction)
   test_examples = []
@@ -562,8 +562,9 @@ def _merge_single_example_file_and_labels(
       labeled_example = Example()
       labeled_example.CopyFrom(example)
       features = labeled_example.features
-      features.feature['string_label'].bytes_list.value.append(
-          string_label.encode())
+      features.feature['string_label'].bytes_list.value[:] = [
+          string_label.encode()
+      ]
       features.feature['label_dataset_id'].bytes_list.value.append(
           dataset_id.encode())
       label_feature = features.feature['label'].float_list

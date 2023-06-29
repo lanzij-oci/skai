@@ -13,6 +13,7 @@
 # limitations under the License.
 """Pipeline for generating tensorflow examples from satellite images."""
 
+import binascii
 import collections
 import dataclasses
 import hashlib
@@ -22,6 +23,7 @@ import logging
 import os
 import pathlib
 import pickle
+import struct
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 import apache_beam as beam
@@ -223,10 +225,11 @@ def get_building_centroids(
     NotInitializedEarthEngineError: if earth couldnot be initialized.
     NoBuildingFoundError: if no building is found in the area of interest.
   """
+  centroids = None
   if config.buildings_method == 'file':
-    return buildings.read_buildings_file(config.buildings_file, regions)
+    centroids = buildings.read_buildings_file(config.buildings_file, regions)
   elif config.buildings_method == 'open_street_map':
-    return open_street_map.get_building_centroids_in_regions(
+    centroids = open_street_map.get_building_centroids_in_regions(
         regions, config.overpass_url
     )
   elif config.buildings_method == 'open_buildings':
@@ -242,12 +245,13 @@ def get_building_centroids(
         regions, config.open_buildings_feature_collection,
         config.open_buildings_confidence, output_path
     )
-    if not centroids:
-      raise NoBuildingFoundError()
     logging.info('Open Buildings centroids saved to %s', output_path)
-    return centroids
+  else:
+    raise ValueError('Invalid value for "buildings_method" flag.')
 
-  raise ValueError('Invalid value for "buildings_method" flag.')
+  if not centroids:
+    raise NoBuildingFoundError()
+  return list(set(centroids))  # Deduplicate.
 
 
 def _to_grayscale(image: np.ndarray) -> np.ndarray:
@@ -335,6 +339,20 @@ def _make_example_id(longitude: float, latitude: float, before_image_id: str,
   serialized = pickle.dumps(
       (longitude, latitude, before_image_id, after_image_id))
   return hashlib.md5(serialized).hexdigest()
+
+
+def _make_int64_id(example_id: str) -> int:
+  """Converts 128 bit hex string into 64 bit signed integer.
+
+  Casts the first 64 bits of the hex string into an integer.
+
+  Args:
+    example_id: 128 bit hex string.
+
+  Returns:
+    64 bit signed integer.
+  """
+  return struct.unpack('<q', binascii.a2b_hex(example_id[:16]))[0]
 
 
 class GenerateExamplesFn(beam.DoFn):
@@ -426,11 +444,13 @@ class GenerateExamplesFn(beam.DoFn):
     example_id = _make_example_id(
         longitude, latitude, before_image_id, after_image_id
     )
+    int64_id = _make_int64_id(example_id)
     plus_code = openlocationcode.encode(
         latitude=latitude, longitude=longitude, codeLength=_PLUS_CODE_LENGTH
     )
     utils.add_bytes_feature('plus_code', plus_code.encode(), example)
     utils.add_bytes_feature('example_id', example_id.encode(), example)
+    utils.add_int64_feature('int64_id', int64_id, example)
     utils.add_bytes_feature(
         'pre_image_png_large', tf.io.encode_png(before_image).numpy(), example
     )
@@ -634,7 +654,7 @@ def _generate_examples(
   """
   scalar_features = (
       pipeline
-      | stage_prefix + 'enconde_coordinates_path' >> beam.Create(
+      | stage_prefix + 'encode_coordinates_path' >> beam.Create(
           [coordinates_path])
       | stage_prefix + 'create_scalar_features' >> beam.FlatMap(
           _coordinates_to_scalar_features))
@@ -648,25 +668,37 @@ def _generate_examples(
     # alignment algorithm at most +/-_MAX_DISPLACEMENT pixels of movement in
     # either dimension to find the best alignment.
     after_image_size += 2 * _MAX_DISPLACEMENT
-    for i, image_path in enumerate(_expand_patterns(before_image_patterns)):
-      patches = read_raster.extract_patches_from_raster(
-          pipeline, coordinates_path, image_path, large_patch_size, resolution,
-          gdal_env, f'before{i:02d}')
-      features = (
-          patches
-          | stage_prefix + f'_before{i:02d}_to_feature' >> beam.MapTuple(
-              lambda key, value: (key, _FeatureUnion(before_image=value))))
-      input_collections.append(features)
+    before_raster_paths = _expand_patterns(before_image_patterns)
+    before_patches = read_raster.extract_patches_from_rasters(
+        pipeline,
+        coordinates_path,
+        before_raster_paths,
+        large_patch_size,
+        resolution,
+        gdal_env,
+        'before',
+    )
+    before_image_features = (
+        before_patches
+        | stage_prefix + '_before_to_feature' >> beam.MapTuple(
+            lambda key, value: (key, _FeatureUnion(before_image=value))))
+    input_collections.append(before_image_features)
 
-  for i, image_path in enumerate(_expand_patterns(after_image_patterns)):
-    patches = read_raster.extract_patches_from_raster(
-        pipeline, coordinates_path, image_path, after_image_size, resolution,
-        gdal_env, f'after{i:02d}')
-    features = (
-        patches
-        | stage_prefix + f'_after{i:02d}_to_feature' >> beam.MapTuple(
-            lambda key, value: (key, _FeatureUnion(after_image=value))))
-    input_collections.append(features)
+  after_raster_paths = _expand_patterns(after_image_patterns)
+  after_patches = read_raster.extract_patches_from_rasters(
+      pipeline,
+      coordinates_path,
+      after_raster_paths,
+      after_image_size,
+      resolution,
+      gdal_env,
+      'after',
+  )
+  after_image_features = (
+      after_patches
+      | stage_prefix + '_after_to_feature' >> beam.MapTuple(
+          lambda key, value: (key, _FeatureUnion(after_image=value))))
+  input_collections.append(after_image_features)
 
   large_examples = (
       input_collections
