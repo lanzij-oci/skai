@@ -26,3 +26,4 @@ tqdm
 openlocationcode
 xmanager
 tensorflow-text
+pandas_gbq
