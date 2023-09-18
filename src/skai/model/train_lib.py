@@ -8,15 +8,20 @@ and evaluating on provided eval datasets.
 
 import itertools
 import os
-from typing import Dict, List, Optional, Union
+from typing import Dict
+from typing import List
+from typing import Optional
+from typing import Union
 
 from absl import logging
 import numpy as np
 from skai.model import data
+from skai.model import log_metrics_callback
 from skai.model import metrics as metrics_lib
 from skai.model import models
-import tensorflow as tf
+from skai.model import xmanager_external_metric_logger
 
+import tensorflow as tf
 
 
 @tf.keras.saving.register_keras_serializable('two_headed_output_model')
@@ -319,8 +324,7 @@ def evaluate_model(
         logging.info('Average Acc: %f', results['avg_acc'])
         logging.info('Average Acc: %f', results['weighted_avg_acc'])
   if save_best_model:
-    model_dir = os.path.join(output_dir, 'model')
-    loaded_model = tf.keras.models.load_model(model_dir)
+    loaded_model = tf.keras.models.load_model(os.path.join(output_dir, 'model'))
     compiled_model = compile_model(
         loaded_model, loaded_model.model.model_params
     )
@@ -377,8 +381,10 @@ def create_callbacks(
     save_model_checkpoints: bool = False,
     save_best_model: bool = True,
     early_stopping: bool = True,
+    vizier_trial_name: str | None = None,
     batch_size: Optional[int] = 64,
     num_train_examples: Optional[int] = None,
+    is_vertex: bool = False
 ) -> List[tf.keras.callbacks.Callback]:
   """Creates callbacks, such as saving model checkpoints, for training.
 
@@ -388,8 +394,10 @@ def create_callbacks(
     save_best_model: Boolean for whether or not to save best model.
     early_stopping: Boolean for whether or not to use early stopping during
       training.
+    vizier_trial_name: Vizier trial name.
     batch_size: Optional integer for batch size.
     num_train_examples: Optional integer for total number of training examples.
+    is_vertex: Set to true if training on VertexAI.
 
   Returns:
     List of callbacks.
@@ -407,16 +415,16 @@ def create_callbacks(
     callbacks.append(checkpoint_callback)
   if save_best_model:
     model_dir = os.path.join(output_dir, 'model')
-    # TODO(jlee24,mohammedelfatihsalah): Update to AUPRC.
     model_callback = tf.keras.callbacks.ModelCheckpoint(
         filepath=os.path.join(
-            model_dir,
-            'aucpr-{val_main_aucpr_1_vs_rest:.2f}'),
+            model_dir, 'aucpr-{val_main_aucpr_1_vs_rest:.2f}'
+        ),
         monitor='val_main_aucpr_1_vs_rest',
         mode='max',
         save_weights_only=False,
         save_best_only=True,
-        save_traces=True)
+        save_traces=True,
+    )
     callbacks.append(model_callback)
   if early_stopping:
     early_stopping_callback = tf.keras.callbacks.EarlyStopping(
@@ -429,6 +437,20 @@ def create_callbacks(
         restore_best_weights=True
     )
     callbacks.append(early_stopping_callback)
+
+  dataset_size = (
+      num_train_examples if num_train_examples != 0 else batch_size * 100
+  )
+  trial_name = vizier_trial_name if is_vertex else None
+  hyperparameter_tuner_callback = log_metrics_callback.LogMetricsCallback(
+      metric_loggers=[
+          xmanager_external_metric_logger.XManagerMetricLogger(trial_name)
+      ],
+      logging_frequency=int(dataset_size / batch_size) * batch_size,
+      batch_size=batch_size,
+      num_train_examples_per_epoch=dataset_size,
+  )
+  callbacks.append(hyperparameter_tuner_callback)
   return callbacks
 
 
@@ -475,7 +497,8 @@ def train_ensemble(
     output_dir: str,
     save_model_checkpoints: bool = True,
     early_stopping: bool = True,
-    example_id_to_bias_table: Optional[tf.lookup.StaticHashTable] = None
+    example_id_to_bias_table: Optional[tf.lookup.StaticHashTable] = None,
+    is_vertex: bool = False,
 ) -> List[tf.keras.Model]:
   """Trains an ensemble of models, locally. See xm_launch.py for parallelized.
 
@@ -489,6 +512,7 @@ def train_ensemble(
     save_model_checkpoints: Boolean for saving checkpoints during training.
     early_stopping: Boolean for early stopping during training.
     example_id_to_bias_table: Hash table mapping example ID to bias label.
+    is_vertex: Set to true if training on VertexAI.
 
   Returns:
     List of trained models and, optionally, predictions.
@@ -506,7 +530,7 @@ def train_ensemble(
     combo_val = data.gather_data_splits(combo, dataloader.val_splits)
     combo_ckpt_dir = os.path.join(output_dir, combo_name, 'checkpoints')
     combo_callbacks = create_callbacks(combo_ckpt_dir, save_model_checkpoints,
-                                       early_stopping)
+                                       early_stopping, is_vertex)
     combo_model = run_train(
         combo_train,
         combo_val,
@@ -569,7 +593,7 @@ def find_epoch_ckpt_path(epoch: int,
     # Uses nearest available epoch in `ckpt_epochs`.
     nearest_epoch_id = np.argmin(np.abs(ckpt_epochs - epoch))
     nearest_epoch = ckpt_epochs[nearest_epoch_id]
-    tf.compat.v1.logging.warn(
+    tf.get_logger().warn(
         'Required epoch (%s) not in list of available epochs `%s`.'
         'Use nearest epoch `%s`', epoch, np.unique(ckpt_epochs), nearest_epoch)
     epoch = nearest_epoch
@@ -610,13 +634,13 @@ def load_trained_models(combos_dir: str,
     if ckpt_epoch < 0:
       # Loads the latest checkpoint.
       checkpoint_path = tf.train.latest_checkpoint(ckpt_dir)
-      tf.compat.v1.logging.info(f'Loading best model from `{checkpoint_path}`')
+      tf.get_logger().info(f'Loading best model from `{checkpoint_path}`')
     else:
       # Loads the required checkpoint.
       # By default, select the checkpoint with highest validation AUC.
       checkpoint_path = find_epoch_ckpt_path(
           ckpt_epoch, ckpt_dir, metric_name='val_auc', mode='highest')
-      tf.compat.v1.logging.info(
+      tf.get_logger().info(
           f'Loading model for checkpoint {ckpt_epoch} from `{checkpoint_path}`')
 
     combo_model = load_one_checkpoint(checkpoint_path=checkpoint_path,
@@ -855,7 +879,10 @@ def train_and_evaluate(
     save_best_model: bool,
     early_stopping: bool,
     ensemble_dir: Optional[str] = '',
-    example_id_to_bias_table: Optional[tf.lookup.StaticHashTable] = None):
+    example_id_to_bias_table: Optional[tf.lookup.StaticHashTable] = None,
+    vizier_trial_name: str | None = None,
+    is_vertex: bool = False
+):
   """Performs the operations of training, optionally ensembling, and evaluation.
 
   Args:
@@ -873,6 +900,8 @@ def train_and_evaluate(
     ensemble_dir: Optional string for a directory that stores trained model
       checkpoints. If specified, will load the models from directory.
     example_id_to_bias_table: Lookup table mapping example ID to bias label.
+    vizier_trial_name: Vizier trial name.
+    is_vertex: Set to true if training on VertexAI.
 
   Returns:
     Trained Model(s)
@@ -894,8 +923,10 @@ def train_and_evaluate(
         save_model_checkpoints,
         save_best_model,
         early_stopping,
+        vizier_trial_name,
         model_params.batch_size,
-        dataloader.num_train_examples)
+        dataloader.num_train_examples,
+        is_vertex)
 
     two_head_model = run_train(
         dataloader.train_ds,
